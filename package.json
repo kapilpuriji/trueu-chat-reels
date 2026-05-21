@@ -1,0 +1,24 @@
+{
+  "name": "chat-typing-reel",
+  "version": "1.0.0",
+  "description": "Programmatic chat-typing reels using Remotion",
+  "scripts": {
+    "dev": "remotion studio",
+    "start": "node server.mjs",
+    "build": "remotion render ChatReel out/video.mp4 && open out/video.mp4",
+    "build:batch": "node render-batch.mjs"
+  },
+  "dependencies": {
+    "@remotion/bundler": "^4.0.464",
+    "@remotion/cli": "4.0.454",
+    "@remotion/renderer": "^4.0.464",
+    "express": "^5.2.1",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "remotion": "4.0.454"
+  },
+  "devDependencies": {
+    "@types/react": "19.0.0",
+    "typescript": "5.5.4"
+  }
+}
