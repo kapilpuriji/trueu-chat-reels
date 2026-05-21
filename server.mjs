@@ -199,13 +199,21 @@ app.post("/render", async (req, res) => {
     console.log(`[${jobId}] Video will be ${durationSec}s (${composition.durationInFrames} frames)`);
 
     // Render MP4
+    // concurrency: 1 — keep memory low on Railway (1080x1920 + h264 is heavy).
+    // gl: "swiftshader" — software GL; hardware GL is not available in the container.
+    // enableMultiProcessOnLinux — needed when running Chromium as root in Docker.
     await renderMedia({
       composition,
       serveUrl: bundleLocation,
       codec: "h264",
       outputLocation: outputPath,
       inputProps,
-      chromiumOptions: { enableMultiProcessOnLinux: true },
+      concurrency: 1,
+      chromiumOptions: {
+        enableMultiProcessOnLinux: true,
+        gl: "swiftshader",
+        disableWebSecurity: true,
+      },
       ...(BROWSER_PATH ? { browserExecutable: BROWSER_PATH } : {}),
     });
 
