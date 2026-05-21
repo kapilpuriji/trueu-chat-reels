@@ -1,16 +1,6 @@
 // ============================================================================
 // REMOTION RENDER SERVER — TrueU.ai Chat Reel Generator
 // ============================================================================
-// Run locally:  node server.mjs
-// Deploy on:    Render.com or Railway
-//
-// Test:         GET  http://localhost:3000/health
-// Render:       POST http://localhost:3000/render
-//
-// Environment variables:
-//   API_KEY   — Bearer token for auth (default: "changeme" for local testing)
-//   PORT      — Server port (default: 3000)
-// ============================================================================
 
 import express from "express";
 import { bundle } from "@remotion/bundler";
@@ -26,146 +16,107 @@ app.use(express.json({ limit: "10mb" }));
 const API_KEY = process.env.API_KEY || "changeme";
 
 // ============================================================================
-// FIND CHROMIUM — checks system paths + Remotion's download
+// FIND CHROMIUM
 // ============================================================================
 function findChromium() {
-  const candidates = [
+  const paths = [
     process.env.CHROMIUM_PATH,
     process.env.PUPPETEER_EXECUTABLE_PATH,
-  ];
-
-  const systemPaths = [
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
   ];
 
-  try {
-    const result = execSync(
-      "which chromium 2>/dev/null || which chromium-browser 2>/dev/null || which google-chrome 2>/dev/null || echo ''",
-      { encoding: "utf-8" }
-    ).trim();
-    if (result) candidates.push(result);
-  } catch (_) {}
-
-  for (const p of [...candidates, ...systemPaths]) {
+  for (const p of paths) {
     if (p && fs.existsSync(p)) {
       console.log("Found Chromium at:", p);
       return p;
     }
   }
 
-  console.log("No system Chromium found — Remotion will use its own");
+  try {
+    const result = execSync("which chromium || which chromium-browser || echo ''", { encoding: "utf-8" }).trim();
+    if (result && fs.existsSync(result)) {
+      console.log("Found Chromium via which:", result);
+      return result;
+    }
+  } catch (_) {}
+
+  console.log("No system Chromium — Remotion will use its own");
   return null;
 }
 
 const BROWSER_PATH = findChromium();
 
 // ============================================================================
-// BUNDLE REMOTION PROJECT ONCE ON STARTUP
+// BUNDLE — use pre-built if available, otherwise bundle at runtime
 // ============================================================================
+const PREBUILT_BUNDLE = path.resolve("./bundle");
 let bundleLocation = null;
 
+// Check for pre-built bundle (created during Docker build by prebundle.mjs)
+if (fs.existsSync(path.join(PREBUILT_BUNDLE, "index.html"))) {
+  bundleLocation = PREBUILT_BUNDLE;
+  console.log("Using pre-built bundle at", bundleLocation);
+} else {
+  console.log("No pre-built bundle found — will bundle at runtime");
+}
+
 async function warmBundle() {
+  if (bundleLocation) return; // already have pre-built bundle
   console.log("Bundling Remotion project...");
   bundleLocation = await bundle({
     entryPoint: path.resolve("./src/index.ts"),
     webpackOverride: (config) => config,
   });
-  console.log("Bundle ready");
+  console.log("Bundle ready at", bundleLocation);
 }
 
 // ============================================================================
-// POST /render — Send messages JSON, get MP4 video back
-//
-// Headers:
-//   Authorization: Bearer changeme
-//   Content-Type: application/json
-//
-// Body:
-// {
-//   "messages": [
-//     { "from": "you", "text": "Your message here" },
-//     { "from": "partner", "text": "Partner reply here" }
-//   ]
-// }
-//
-// Response: MP4 video file (binary)
+// POST /render
 // ============================================================================
 app.post("/render", async (req, res) => {
-  // ---- Auth ----
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (token !== API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  // ---- Get messages from request body ----
   const { messages } = req.body;
 
-  // ---- Validate ----
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({
-      error: "Missing 'messages' array in request body",
-      example: {
-        messages: [
-          { from: "you", text: "Your message" },
-          { from: "partner", text: "Partner reply" },
-        ],
-      },
+      error: "Missing 'messages' array",
+      example: { messages: [{ from: "you", text: "Hello" }, { from: "partner", text: "Hi there" }] },
     });
   }
-
-  if (messages.length < 2) {
-    return res.status(400).json({ error: "Need at least 2 messages" });
-  }
-
-  if (messages.length > 20) {
-    return res.status(400).json({ error: "Max 20 messages (video would be too long)" });
-  }
+  if (messages.length < 2) return res.status(400).json({ error: "Need at least 2 messages" });
+  if (messages.length > 20) return res.status(400).json({ error: "Max 20 messages" });
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-
     if (!msg.from || !["you", "partner"].includes(msg.from)) {
-      return res.status(400).json({
-        error: `messages[${i}].from must be "you" or "partner", got "${msg.from}"`,
-      });
+      return res.status(400).json({ error: `messages[${i}].from must be "you" or "partner"` });
     }
-
     if (!msg.text || typeof msg.text !== "string" || msg.text.trim() === "") {
-      return res.status(400).json({
-        error: `messages[${i}].text is missing or empty`,
-      });
+      return res.status(400).json({ error: `messages[${i}].text is missing or empty` });
     }
-
-    // Clean em dashes silently
     messages[i].text = messages[i].text.replace(/—/g, " - ");
   }
-
   if (messages[0].from !== "you") {
-    return res.status(400).json({
-      error: 'First message must be from "you" (it becomes the intro hook text)',
-    });
+    return res.status(400).json({ error: "First message must be from 'you'" });
   }
-  
 
-  // ---- Check server is ready ----
   if (!bundleLocation) {
-    return res.status(503).json({
-      error: "Server is still starting up. Try again in 30 seconds.",
-    });
+    return res.status(503).json({ error: "Server is still starting up. Try again in 30 seconds." });
   }
 
-  // ---- Render ----
   const jobId = crypto.randomUUID().slice(0, 8);
   const outputPath = path.join("/tmp", `${jobId}.mp4`);
   const startTime = Date.now();
-
   console.log(`[${jobId}] Rendering ${messages.length} messages...`);
 
   try {
-    // These props override defaultMessages in messages.ts
     const inputProps = {
       messages,
       contactName: "Thinking Partner",
@@ -178,31 +129,30 @@ app.post("/render", async (req, res) => {
       enableAudio: true,
     };
 
-    // Calculate video duration from the messages
     const composition = await selectComposition({
       serveUrl: bundleLocation,
       id: "ChatReel",
       inputProps,
     });
 
-    const durationSec = (composition.durationInFrames / composition.fps).toFixed(1);
-    console.log(`[${jobId}] Video will be ${durationSec}s (${composition.durationInFrames} frames)`);
+    console.log(`[${jobId}] Duration: ${(composition.durationInFrames / composition.fps).toFixed(1)}s`);
 
-    // Render MP4
     await renderMedia({
       composition,
       serveUrl: bundleLocation,
       codec: "h264",
       outputLocation: outputPath,
       inputProps,
-      chromiumOptions: { enableMultiProcessOnLinux: true },
+      chromiumOptions: {
+        enableMultiProcessOnLinux: true,
+        args: ["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+      },
       ...(BROWSER_PATH ? { browserExecutable: BROWSER_PATH } : {}),
     });
 
     const renderSec = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[${jobId}] Done in ${renderSec}s`);
 
-    // Send MP4 file back
     const videoBuffer = fs.readFileSync(outputPath);
     fs.unlinkSync(outputPath);
 
@@ -217,38 +167,36 @@ app.post("/render", async (req, res) => {
 });
 
 // ============================================================================
-// GET /health — Check if server is ready
+// GET /health
 // ============================================================================
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     ready: !!bundleLocation,
     chromium: BROWSER_PATH || "remotion-managed",
+    bundlePath: bundleLocation || "not ready",
   });
 });
 
 // ============================================================================
-// GET / — Root route (needed for Railway/Render health checks)
+// GET /
 // ============================================================================
 app.get("/", (req, res) => {
   res.json({
     service: "TrueU Chat Reel Renderer",
     status: bundleLocation ? "ready" : "warming up",
-    usage: {
-      health: "GET /health",
-      render: "POST /render with { messages: [...] }",
-    },
+    endpoints: { health: "GET /health", render: "POST /render" },
   });
 });
 
 // ============================================================================
-// START SERVER
+// START — listen FIRST, then bundle (so Railway health checks pass)
 // ============================================================================
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on 0.0.0.0:${PORT}`);
-  
+
   warmBundle()
     .then(() => console.log("Ready for renders"))
     .catch((err) => console.error("Bundle failed:", err.message));
