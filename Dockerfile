@@ -1,4 +1,5 @@
-FROM node:20-slim
+# Pin to bookworm so libasound2 / libatk* package names stay stable.
+FROM node:20-bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     chromium \
@@ -23,6 +24,8 @@ RUN apt-get update && apt-get install -y \
 ENV CHROMIUM_PATH=/usr/bin/chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV NODE_OPTIONS=--max-old-space-size=2048
+# Railway injects PORT; keep a sane default for local docker runs.
+ENV PORT=3000
 
 WORKDIR /app
 
@@ -31,7 +34,8 @@ RUN npm ci
 
 COPY . .
 
-# Pre-bundle the Remotion project so the container starts fast on Railway.
+# Pre-bundle the Remotion project so the container starts fast on Railway
+# (otherwise the first request after deploy times out on Railway's healthcheck).
 RUN node prebundle.mjs
 
 EXPOSE 3000
