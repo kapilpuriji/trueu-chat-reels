@@ -1,13 +1,11 @@
 {
   "name": "chat-typing-reel",
   "version": "1.0.0",
-  "description": "Programmatic chat-typing reels using Remotion",
   "type": "module",
   "scripts": {
     "dev": "remotion studio",
     "start": "node server.mjs",
-    "build": "echo skipped",
-    "build:batch": "node render-batch.mjs"
+    "build": "echo skipped"
   },
   "dependencies": {
     "@remotion/bundler": "^4.0.464",
