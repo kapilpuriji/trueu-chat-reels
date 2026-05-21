@@ -148,6 +148,7 @@ app.post("/render", async (req, res) => {
       error: 'First message must be from "you" (it becomes the intro hook text)',
     });
   }
+  
 
   // ---- Check server is ready ----
   if (!bundleLocation) {
