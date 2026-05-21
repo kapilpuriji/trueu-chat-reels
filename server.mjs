@@ -246,8 +246,10 @@ app.get("/", (req, res) => {
 // ============================================================================
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, "0.0.0.0", async () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on 0.0.0.0:${PORT}`);
-  await warmBundle();
-  console.log("Ready for renders");
+  
+  warmBundle()
+    .then(() => console.log("Ready for renders"))
+    .catch((err) => console.error("Bundle failed:", err.message));
 });
