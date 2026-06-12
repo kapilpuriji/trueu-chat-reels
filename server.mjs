@@ -138,11 +138,14 @@ async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
   const tag = totalChunks > 1 ? `${jobId}-c${chunkIndex}` : jobId;
   const outputPath = path.join(TMP_DIR, `${tag}.mp4`);
 
+  // backgroundVideo is disabled on Railway: OffthreadVideo uses a Rust compositor
+  // that gets SIGKILL'd on constrained containers. The solid theme background still
+  // looks great. Re-enable locally with ENABLE_BG_VIDEO=1 if needed.
   const inputProps = {
     messages,
     contactName: "Thinking Partner",
     contactSubtitle: "TrueU.ai",
-    backgroundVideo: "background.mp4",
+    backgroundVideo: process.env.ENABLE_BG_VIDEO === "1" ? "background.mp4" : null,
     backgroundVideoDurationInFrames: 750,
     backgroundDim: 0,
     showSafeZones: false,
@@ -171,6 +174,9 @@ async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
     codec: "h264",
     outputLocation: outputPath,
     inputProps,
+    // Give each frame up to 2 minutes to load assets (orb PNGs, fonts, video).
+    // Default is 30s which is too short for Railway's cold filesystem on first render.
+    timeoutInMilliseconds: 120_000,
     // Faster H.264: ultrafast preset cuts encode time 3-5x vs default "medium"
     x264Preset: "ultrafast",
     pixelFormat: "yuv420p",

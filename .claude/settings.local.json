@@ -8,7 +8,11 @@
       "Bash(node -e \"const r = require\\('@remotion/renderer'\\); const rm = r.renderMedia.toString\\(\\).slice\\(0,200\\); console.log\\(rm\\)\")",
       "Bash(node -e \"const r = require\\('@remotion/renderer'\\); console.log\\(r.openBrowser.toString\\(\\).slice\\(0, 300\\)\\)\")",
       "Bash(node -e \"const r = require\\('@remotion/renderer'\\); console.log\\(r.openBrowser.toString\\(\\).slice\\(0, 800\\)\\)\")",
-      "Bash(node -e \"const r = require\\('@remotion/renderer'\\); const src = r.renderMedia.toString\\(\\); const idx = src.indexOf\\('chromiumOptions'\\); console.log\\(src.slice\\(idx, idx+500\\)\\)\")"
+      "Bash(node -e \"const r = require\\('@remotion/renderer'\\); const src = r.renderMedia.toString\\(\\); const idx = src.indexOf\\('chromiumOptions'\\); console.log\\(src.slice\\(idx, idx+500\\)\\)\")",
+      "Bash(node -e \"const r = require\\('@remotion/renderer'\\); console.log\\(Object.keys\\(r\\).filter\\(k => k.toLowerCase\\(\\).includes\\('timeout'\\) || k.toLowerCase\\(\\).includes\\('delay'\\)\\)\\)\")",
+      "Bash(node -e \"const r = require\\('@remotion/renderer'\\); const src = r.renderMedia.toString\\(\\); const idx = src.indexOf\\('timeout'\\); console.log\\(src.slice\\(idx-20, idx+200\\)\\)\")",
+      "Bash(node -e \"const r = require\\('@remotion/renderer'\\); const src = r.renderMedia.toString\\(\\); console.log\\(src.match\\(/timeoutInMilliseconds[^,;\\)]{0,100}/\\)\\)\")",
+      "Bash(node -e \"const r = require\\('@remotion/renderer'\\); const src = JSON.stringify\\(r\\); console.log\\(src.match\\(/DEFAULT_TIMEOUT[^}]{0,50}/\\)\\)\")"
     ]
   }
 }

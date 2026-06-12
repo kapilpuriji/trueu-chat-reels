@@ -2,13 +2,6 @@ import { Composition } from "remotion";
 import { ChatReel } from "./ChatReel";
 import { defaultMessages, computeTimeline, FPS } from "./messages";
 
-// Give Railway's cold container up to 2 minutes to load all assets.
-// The default is 28s which is too short for 75 orb PNGs on first boot.
-if (typeof window !== "undefined") {
-  // @ts-expect-error – Remotion reads this global to override the default timeout
-  window.remotion_delayRenderTimeoutInMilliseconds = 120_000;
-}
-
 // Reel format: 1080x1920 (9:16 vertical)
 export const Root: React.FC = () => {
   return (
