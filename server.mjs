@@ -2,7 +2,7 @@
 // REMOTION RENDER SERVER — TrueU.ai Chat Reel Generator
 // ============================================================================
 // Run locally:  node server.mjs
-// Deploy on:    Render.com or Railway
+// Deploy on:    Railway (Dockerfile)
 //
 // Test:         GET  http://localhost:3000/health
 // Render:       POST http://localhost:3000/render
@@ -18,7 +18,6 @@ import { renderMedia, selectComposition } from "@remotion/renderer";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
-import { execSync } from "child_process";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -26,30 +25,19 @@ app.use(express.json({ limit: "10mb" }));
 const API_KEY = process.env.API_KEY || "changeme";
 
 // ============================================================================
-// FIND CHROMIUM — checks system paths + Remotion's download
+// FIND CHROMIUM — checks env vars then known system paths
 // ============================================================================
 function findChromium() {
   const candidates = [
     process.env.CHROMIUM_PATH,
     process.env.PUPPETEER_EXECUTABLE_PATH,
-  ];
-
-  const systemPaths = [
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
   ];
 
-  try {
-    const result = execSync(
-      "which chromium 2>/dev/null || which chromium-browser 2>/dev/null || which google-chrome 2>/dev/null || echo ''",
-      { encoding: "utf-8" }
-    ).trim();
-    if (result) candidates.push(result);
-  } catch (_) {}
-
-  for (const p of [...candidates, ...systemPaths]) {
+  for (const p of candidates) {
     if (p && fs.existsSync(p)) {
       console.log("Found Chromium at:", p);
       return p;
@@ -75,6 +63,10 @@ let bundleLocation = fs.existsSync(path.join(PREBUILT_BUNDLE, "index.html"))
 if (bundleLocation) {
   console.log("Using pre-built bundle at", bundleLocation);
 }
+
+// Track ongoing renders so we can reject concurrent overload
+let activeRenders = 0;
+const MAX_CONCURRENT_RENDERS = 2;
 
 async function warmBundle() {
   if (bundleLocation) return;
@@ -105,9 +97,23 @@ async function warmBundle() {
 // ============================================================================
 app.post("/render", async (req, res) => {
   // ---- Auth ----
-  const token = req.headers.authorization?.replace("Bearer ", "");
+  const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
   if (token !== API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  // ---- Check server is ready ----
+  if (!bundleLocation) {
+    return res.status(503).json({
+      error: "Server is still starting up. Try again in 30 seconds.",
+    });
+  }
+
+  // ---- Reject if too many renders running ----
+  if (activeRenders >= MAX_CONCURRENT_RENDERS) {
+    return res.status(429).json({
+      error: "Server busy — too many renders in progress. Try again shortly.",
+    });
   }
 
   // ---- Get messages from request body ----
@@ -131,7 +137,9 @@ app.post("/render", async (req, res) => {
   }
 
   if (messages.length > 20) {
-    return res.status(400).json({ error: "Max 20 messages (video would be too long)" });
+    return res.status(400).json({
+      error: "Max 20 messages (video would be too long)",
+    });
   }
 
   for (let i = 0; i < messages.length; i++) {
@@ -149,21 +157,21 @@ app.post("/render", async (req, res) => {
       });
     }
 
-    // Clean em dashes silently
-    messages[i].text = messages[i].text.replace(/—/g, " - ");
+    // Sanitize: replace em dashes (break font rendering) and trim whitespace
+    messages[i].text = messages[i].text.replace(/—/g, " - ").trim();
+
+    // Cap very long messages so render stays fast.
+    // "you" messages: long text = many typing frames. Cap at 200 chars.
+    // "partner" messages: long text = long word-stream. Cap at 400 chars.
+    const charLimit = msg.from === "you" ? 200 : 400;
+    if (messages[i].text.length > charLimit) {
+      messages[i].text = messages[i].text.slice(0, charLimit).trimEnd() + "...";
+    }
   }
 
   if (messages[0].from !== "you") {
     return res.status(400).json({
       error: 'First message must be from "you" (it becomes the intro hook text)',
-    });
-  }
-  
-
-  // ---- Check server is ready ----
-  if (!bundleLocation) {
-    return res.status(503).json({
-      error: "Server is still starting up. Try again in 30 seconds.",
     });
   }
 
@@ -172,10 +180,12 @@ app.post("/render", async (req, res) => {
   const outputPath = path.join("/tmp", `${jobId}.mp4`);
   const startTime = Date.now();
 
-  console.log(`[${jobId}] Rendering ${messages.length} messages...`);
+  activeRenders++;
+  console.log(
+    `[${jobId}] START — ${messages.length} messages | activeRenders=${activeRenders}`
+  );
 
   try {
-    // These props override defaultMessages in messages.ts
     const inputProps = {
       messages,
       contactName: "Thinking Partner",
@@ -188,65 +198,107 @@ app.post("/render", async (req, res) => {
       enableAudio: true,
     };
 
-    // Calculate video duration from the messages
+    // selectComposition calculates exact video duration from the messages
     const composition = await selectComposition({
       serveUrl: bundleLocation,
       id: "ChatReel",
       inputProps,
+      timeoutInMilliseconds: 30000,
     });
 
     const durationSec = (composition.durationInFrames / composition.fps).toFixed(1);
-    console.log(`[${jobId}] Video will be ${durationSec}s (${composition.durationInFrames} frames)`);
+    console.log(
+      `[${jobId}] ${durationSec}s video (${composition.durationInFrames} frames @ ${composition.fps}fps)`
+    );
 
-    // Render MP4
-    // concurrency: 1 — keep memory low on Railway (1080x1920 + h264 is heavy).
-    // gl: "swiftshader" — software GL; hardware GL is not available in the container.
-    // enableMultiProcessOnLinux — needed when running Chromium as root in Docker.
     await renderMedia({
       composition,
       serveUrl: bundleLocation,
       codec: "h264",
       outputLocation: outputPath,
       inputProps,
-      concurrency: 1,
+
+      // Speed settings — tuned for 8GB Railway container
+      concurrency: 4,              // 4 parallel Chrome tabs; 8GB handles this fine
+      jpegQuality: 80,             // Remotion default; balanced speed vs quality
+      x264Preset: "veryfast",      // Much faster encode, imperceptible quality diff for reels
+      timeoutInMilliseconds: 600000, // 10-minute ceiling per render
+
       chromiumOptions: {
-        enableMultiProcessOnLinux: true,
-        gl: "swiftshader",
+        enableMultiProcessOnLinux: true, // required when running as root in Docker
+        gl: "swiftshader",               // software GL — no GPU in Railway containers
         disableWebSecurity: true,
+        ignoreCertificateErrors: true,
       },
+
       ...(BROWSER_PATH ? { browserExecutable: BROWSER_PATH } : {}),
+
+      onProgress: ({ progress }) => {
+        const pct = Math.round(progress * 100);
+        if (pct % 20 === 0) {
+          console.log(`[${jobId}] ${pct}%`);
+        }
+      },
     });
 
     const renderSec = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[${jobId}] Done in ${renderSec}s`);
+    const stat = fs.statSync(outputPath);
+    const sizeMb = (stat.size / 1024 / 1024).toFixed(1);
+    console.log(`[${jobId}] DONE in ${renderSec}s — ${sizeMb}MB`);
 
-    // Send MP4 file back
-    const videoBuffer = fs.readFileSync(outputPath);
-    fs.unlinkSync(outputPath);
-
+    // Stream MP4 back directly — avoids loading whole file into memory
     res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `attachment; filename="reel-${jobId}.mp4"`);
-    return res.send(videoBuffer);
+    res.setHeader("Content-Length", stat.size);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="reel-${jobId}.mp4"`
+    );
+
+    const readStream = fs.createReadStream(outputPath);
+    readStream.pipe(res);
+    readStream.on("end", () => {
+      fs.unlink(outputPath, () => {}); // cleanup after send
+    });
+    readStream.on("error", (streamErr) => {
+      console.error(`[${jobId}] Stream error:`, streamErr.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Failed to stream video" });
+      }
+    });
+
+    return; // response handled by stream
   } catch (err) {
-    console.error(`[${jobId}] FAILED:`, err.message);
+    console.error(`[${jobId}] FAILED in ${((Date.now() - startTime) / 1000).toFixed(1)}s:`, err.message);
     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    return res.status(500).json({ error: "Render failed", detail: err.message });
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "Render failed", detail: err.message });
+    }
+  } finally {
+    activeRenders--;
+    console.log(`[${jobId}] END — activeRenders=${activeRenders}`);
   }
 });
 
 // ============================================================================
-// GET /health — Check if server is ready
+// GET /health
 // ============================================================================
 app.get("/health", (req, res) => {
+  const mem = process.memoryUsage();
   res.json({
     status: "ok",
     ready: !!bundleLocation,
+    activeRenders,
     chromium: BROWSER_PATH || "remotion-managed",
+    memoryMB: {
+      rss: Math.round(mem.rss / 1024 / 1024),
+      heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
+      heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
+    },
   });
 });
 
 // ============================================================================
-// GET / — Root route (needed for Railway/Render health checks)
+// GET / — Root route (Railway health check)
 // ============================================================================
 app.get("/", (req, res) => {
   res.json({
@@ -266,8 +318,10 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on 0.0.0.0:${PORT}`);
-  
   warmBundle()
     .then(() => console.log("Ready for renders"))
-    .catch((err) => console.error("Bundle failed:", err.message));
+    .catch((err) => {
+      console.error("Bundle failed:", err.message);
+      process.exit(1); // crash fast so Railway restarts with a clean state
+    });
 });

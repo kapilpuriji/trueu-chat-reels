@@ -1,3 +1,4 @@
+import React from "react";
 import { Composition } from "remotion";
 import { ChatReel } from "./ChatReel";
 import { defaultMessages, computeTimeline, FPS } from "./messages";

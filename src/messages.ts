@@ -53,8 +53,8 @@ export const defaultMessages: Message[] = [
  *   - HOLD: text holds on screen so viewers absorb it before chat begins
  *   - FADE: last 15 frames fade out as chat fades in
  */
-export const INTRO_BUILD_FRAMES = 55; // ~1.8s of entrance animations
-export const INTRO_HOLD_FRAMES = 75; // 2.5s of hold on the hook text
+export const INTRO_BUILD_FRAMES = 45; // ~1.5s of entrance animations
+export const INTRO_HOLD_FRAMES = 45; // 1.5s of hold on the hook text
 export const INTRO_DURATION_FRAMES =
   INTRO_BUILD_FRAMES + INTRO_HOLD_FRAMES + 15; // +15 cross-fade frames
 
@@ -65,28 +65,27 @@ export const INTRO_DURATION_FRAMES =
  *   - HOLD: everything stays on screen so viewers can absorb the brand moment
  */
 export const OUTRO_BUILD_FRAMES = 180; // ~6s of staggered entrance animations
-export const OUTRO_HOLD_FRAMES = 150; // 5 seconds of hold on the final scene
+export const OUTRO_HOLD_FRAMES = 90;  // 3s hold on the final scene
 export const OUTRO_DURATION_FRAMES = OUTRO_BUILD_FRAMES + OUTRO_HOLD_FRAMES;
 
 // ---- TIMING CONSTANTS (tweak feel here) -----------------------------------
 const TIMING = {
-  /** Base time in frames to type one character ("you" messages). 30fps × 2.8 ≈ 11 chars/sec (20% faster than before) */
-  framesPerChar: 2.8,
+  /** Base time in frames to type one character ("you" messages). 30fps × 2 ≈ 15 chars/sec */
+  framesPerChar: 2,
   /** Pause after "you" finishes typing before the message gets sent */
-  pauseBeforeSend: 18, // 0.6s
+  pauseBeforeSend: 12, // 0.4s
   /** Bubble snap-in animation length */
   bubbleAppear: 10, // 0.33s
   /** Pause after a "you" bubble appears before the partner starts thinking */
-  pauseAfterSend: 8, // 0.27s — short, partner reacts quickly
+  pauseAfterSend: 6, // 0.2s
   /** Duration of the "Thinking..." indicator before the partner's bubble appears */
-  partnerThinkingDuration: 38, // 1.27s
-  /** Frames per word when streaming a partner's message (5 ≈ 6 words/sec) */
-  framesPerWord: 5,
-  /** Pause after a partner message FINISHES STREAMING before next action.
-   *  Word streaming itself gives reading time; this is just a final beat. */
-  pauseAfterPartner: 22, // 0.73s
+  partnerThinkingDuration: 30, // 1s
+  /** Frames per word when streaming a partner's message */
+  framesPerWord: 4,
+  /** Pause after a partner message before next action */
+  pauseAfterPartner: 15, // 0.5s
   /** Beat between the last message and the start of the outro */
-  endPadding: 90, // 3s — extended hold on the final partner message before outro
+  endPadding: 60, // 2s hold on the final partner message before outro
 };
 
 export type TimelineEntry = {
