@@ -70,8 +70,8 @@ export const OUTRO_DURATION_FRAMES = OUTRO_BUILD_FRAMES + OUTRO_HOLD_FRAMES;
 
 // ---- TIMING CONSTANTS (tweak feel here) -----------------------------------
 const TIMING = {
-  /** Base time in frames to type one character ("you" messages). 30fps × 3.5 ≈ 8.5 chars/sec */
-  framesPerChar: 3.5,
+  /** Base time in frames to type one character ("you" messages). 30fps × 2.8 ≈ 11 chars/sec (20% faster than before) */
+  framesPerChar: 2.8,
   /** Pause after "you" finishes typing before the message gets sent */
   pauseBeforeSend: 18, // 0.6s
   /** Bubble snap-in animation length */

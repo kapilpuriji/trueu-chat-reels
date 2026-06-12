@@ -22,6 +22,15 @@ import {
 } from "./messages";
 
 // ============================================================================
+// FONT LOADING — Inter (Regular, Medium, SemiBold) loaded from /public/fonts.
+// The @font-face declarations are rendered as part of the React tree below
+// (see <style> in the main composition). No delayRender used — the browser
+// loads fonts asynchronously and uses them once available. Since text first
+// fades in around frame 25 (~0.8s after render start), fonts are loaded
+// well before any text is visible.
+// ============================================================================
+
+// ============================================================================
 // COLOR THEME
 // - Bone (#E6E6E0) replaces the iMessage blue for "you" bubbles
 // - Charcoal (#272420) replaces black for all body text
@@ -53,7 +62,7 @@ const theme = {
 };
 
 const FONT_STACK =
-  '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif';
+  '"Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif';
 
 // ============================================================================
 // LAYOUT CONSTANTS
@@ -156,6 +165,28 @@ export const ChatReel: React.FC<ChatReelProps> = ({
 
   return (
     <AbsoluteFill style={{ backgroundColor: theme.bg, fontFamily: FONT_STACK }}>
+      {/* Inter font @font-face declarations. Browser loads the woff2 files
+          asynchronously and uses them once ready. Local files = sub-100ms load. */}
+      <style>{`
+        @font-face {
+          font-family: 'Inter';
+          font-weight: 400;
+          font-style: normal;
+          src: url('${staticFile("fonts/Inter-Regular.woff2")}') format('woff2');
+        }
+        @font-face {
+          font-family: 'Inter';
+          font-weight: 500;
+          font-style: normal;
+          src: url('${staticFile("fonts/Inter-Medium.woff2")}') format('woff2');
+        }
+        @font-face {
+          font-family: 'Inter';
+          font-weight: 600;
+          font-style: normal;
+          src: url('${staticFile("fonts/Inter-SemiBold.woff2")}') format('woff2');
+        }
+      `}</style>
       {/* Background video, masked at top and bottom */}
       {backgroundVideo && (
         <AbsoluteFill>
@@ -1002,7 +1033,7 @@ const AudioLayer: React.FC<{ entries: TimelineEntry[]; fps: number }> = ({
                   >
                     <Audio
                       src={staticFile(clickFile)}
-                      volume={0.3}
+                      volume={0.09}
                       playbackRate={playbackRate}
                     />
                   </Sequence>
@@ -1013,7 +1044,7 @@ const AudioLayer: React.FC<{ entries: TimelineEntry[]; fps: number }> = ({
                 durationInFrames={45}
               >
                 {/* Send notification — clearly audible event */}
-                <Audio src={staticFile("send.mp3")} volume={0.7} />
+                <Audio src={staticFile("send.mp3")} volume={0.13} />
               </Sequence>
             </React.Fragment>
           );
@@ -1025,7 +1056,7 @@ const AudioLayer: React.FC<{ entries: TimelineEntry[]; fps: number }> = ({
             from={entry.bubbleAppearFrame}
             durationInFrames={45} // 1.5s — full chime decay
           >
-            <Audio src={staticFile("receive.mp3")} volume={0.7} />
+            <Audio src={staticFile("receive.mp3")} volume={0.1} />
           </Sequence>
         );
       })}
