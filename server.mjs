@@ -8,14 +8,16 @@
 // Render:       POST http://localhost:3000/render
 //
 // Environment variables:
-//   API_KEY   — Bearer token for auth (default: "changeme" for local testing)
-//   PORT      — Server port (default: 3000)
-//   CHUNK_SIZE — Messages per chunk for long videos (default: 8)
+//   API_KEY        — Bearer token for auth (default: "changeme" for local testing)
+//   PORT           — Server port (default: 3000)
+//   CHUNK_SIZE     — Messages per chunk for long videos (default: 20)
+//   CONCURRENCY    — Remotion render threads per chunk (default: auto = half CPU cores)
+//   MAX_PARALLEL   — Max chunks rendered in parallel (default: 2)
 // ============================================================================
 
 import express from "express";
 import { bundle } from "@remotion/bundler";
-import { renderMedia, selectComposition } from "@remotion/renderer";
+import { renderMedia, selectComposition, openBrowser } from "@remotion/renderer";
 import path from "path";
 import os from "os";
 import fs from "fs";
@@ -26,16 +28,27 @@ import { execSync, spawnSync } from "child_process";
 const TMP_DIR = process.platform === "win32" ? os.tmpdir() : "/tmp";
 
 const app = express();
-// Increase body size limit — long chat transcripts can be large JSON
 app.use(express.json({ limit: "50mb" }));
 app.use(express.text({ limit: "50mb" }));
 
 const API_KEY = process.env.API_KEY || "changeme";
 
-// How many messages per chunk before we split into separate renders and concat.
-// Each chunk gets its OWN intro + outro so every segment is self-contained.
-// After rendering all chunks they are concatenated with ffmpeg (no re-encode).
-const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || "8", 10);
+// Larger chunks = fewer browser launches = faster overall for long chats
+const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || "20", 10);
+
+// Render threads: each thread handles one frame. Default = half of available cores,
+// capped at 8 to avoid memory pressure. Override with CONCURRENCY env var.
+const CPU_CORES = os.cpus().length;
+const CONCURRENCY = parseInt(
+  process.env.CONCURRENCY || String(Math.min(Math.max(Math.floor(CPU_CORES / 2), 1), 8)),
+  10
+);
+
+// How many chunks to render in parallel. Each parallel chunk opens its own browser,
+// so don't set this too high on low-RAM machines.
+const MAX_PARALLEL = parseInt(process.env.MAX_PARALLEL || "2", 10);
+
+console.log(`CPU cores: ${CPU_CORES} | render concurrency: ${CONCURRENCY} | parallel chunks: ${MAX_PARALLEL}`);
 
 // ============================================================================
 // FIND CHROMIUM
@@ -87,7 +100,38 @@ function findChromium() {
 const BROWSER_PATH = findChromium();
 
 // ============================================================================
-// CHECK FFMPEG — needed for chunk concatenation
+// BROWSER POOL — reuse browser instances across renders to avoid cold-start cost
+// ============================================================================
+const BROWSER_POOL_SIZE = Math.min(MAX_PARALLEL, 3);
+let browserPool = [];
+
+async function initBrowserPool() {
+  console.log(`Warming ${BROWSER_POOL_SIZE} browser instance(s)...`);
+  const opts = {
+    shouldDumpIo: false,
+    chromiumOptions: {
+      enableMultiProcessOnLinux: true,
+      gl: "swiftshader",
+      disableWebSecurity: true,
+    },
+    ...(BROWSER_PATH ? { browserExecutable: BROWSER_PATH } : {}),
+  };
+  browserPool = await Promise.all(
+    Array.from({ length: BROWSER_POOL_SIZE }, () => openBrowser("chrome", opts))
+  );
+  console.log(`Browser pool ready (${BROWSER_POOL_SIZE} instance(s))`);
+}
+
+function acquireBrowser() {
+  return browserPool.shift() ?? null;
+}
+
+function releaseBrowser(browser) {
+  if (browser) browserPool.push(browser);
+}
+
+// ============================================================================
+// FFMPEG
 // ============================================================================
 function findFfmpeg() {
   const isWindows = process.platform === "win32";
@@ -103,7 +147,6 @@ function findFfmpeg() {
       }
     } catch (_) {}
   }
-  // On Windows or if `which` fails, just rely on PATH
   console.warn("ffmpeg not found on explicit path — relying on PATH");
   return "ffmpeg";
 }
@@ -122,19 +165,56 @@ if (bundleLocation) {
   console.log("Using pre-built bundle at", bundleLocation);
 }
 
+// Cache the composition object so selectComposition isn't called per-chunk
+let cachedCompositionConfig = null;
+
 async function warmBundle() {
-  if (bundleLocation) return;
+  if (bundleLocation) {
+    await warmCompositionCache();
+    return;
+  }
   console.log("No pre-built bundle found — bundling Remotion project...");
   bundleLocation = await bundle({
     entryPoint: path.resolve("./src/index.ts"),
     webpackOverride: (config) => config,
   });
   console.log("Bundle ready");
+  await warmCompositionCache();
+}
+
+// Pre-resolve the static composition config (fps, width, height, codec hints).
+// durationInFrames is per-render so we can't cache that part, but everything
+// else (fps, width, height) is stable and avoids a round-trip to the browser.
+async function warmCompositionCache() {
+  if (cachedCompositionConfig) return;
+  try {
+    const probe = await selectComposition({
+      serveUrl: bundleLocation,
+      id: "ChatReel",
+      inputProps: {
+        messages: [
+          { from: "you", text: "Hello" },
+          { from: "partner", text: "Hi there" },
+        ],
+        contactName: "Thinking Partner",
+        contactSubtitle: "TrueU.ai",
+        backgroundVideo: "background.mp4",
+        backgroundVideoDurationInFrames: 750,
+        backgroundDim: 0,
+        showSafeZones: false,
+        logoImage: "logo.svg",
+        enableAudio: true,
+      },
+    });
+    cachedCompositionConfig = { fps: probe.fps, width: probe.width, height: probe.height };
+    console.log(`Composition cached: ${probe.width}x${probe.height} @ ${probe.fps}fps`);
+  } catch (e) {
+    console.warn("Could not pre-cache composition config:", e.message);
+  }
 }
 
 // ============================================================================
 // RENDER ONE CHUNK
-// Returns the output file path.
 // ============================================================================
 async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
   const tag = totalChunks > 1 ? `${jobId}-c${chunkIndex}` : jobId;
@@ -160,33 +240,70 @@ async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
 
   const durationSec = (composition.durationInFrames / composition.fps).toFixed(1);
   console.log(
-    `[${jobId}] Chunk ${chunkIndex + 1}/${totalChunks}: ${messages.length} msgs, ${durationSec}s`
+    `[${jobId}] Chunk ${chunkIndex + 1}/${totalChunks}: ${messages.length} msgs, ${durationSec}s, ${composition.durationInFrames} frames`
   );
 
-  await renderMedia({
-    composition,
-    serveUrl: bundleLocation,
-    codec: "h264",
-    outputLocation: outputPath,
-    inputProps,
-    concurrency: 1,
-    chromiumOptions: {
-      enableMultiProcessOnLinux: true,
-      gl: "swiftshader",
-      disableWebSecurity: true,
-    },
-    ...(BROWSER_PATH ? { browserExecutable: BROWSER_PATH } : {}),
-  });
+  const browser = acquireBrowser();
 
+  try {
+    await renderMedia({
+      composition,
+      serveUrl: bundleLocation,
+      codec: "h264",
+      outputLocation: outputPath,
+      inputProps,
+      concurrency: CONCURRENCY,
+      // Faster H.264 preset — "ultrafast" cuts encode time by 3-5x vs default "medium"
+      x264Preset: "ultrafast",
+      // Hardware-friendly pixel format
+      pixelFormat: "yuv420p",
+      chromiumOptions: {
+        enableMultiProcessOnLinux: true,
+        gl: "swiftshader",
+        disableWebSecurity: true,
+      },
+      ...(BROWSER_PATH ? { browserExecutable: BROWSER_PATH } : {}),
+      ...(browser ? { puppeteerInstance: browser } : {}),
+      // Log progress every 10% instead of every frame
+      onProgress: ({ progress }) => {
+        const pct = Math.round(progress * 100);
+        if (pct % 10 === 0) {
+          process.stdout.write(`\r[${jobId}] Chunk ${chunkIndex + 1}/${totalChunks}: ${pct}%   `);
+        }
+      },
+    });
+  } finally {
+    releaseBrowser(browser);
+  }
+
+  process.stdout.write("\n");
   console.log(`[${jobId}] Chunk ${chunkIndex + 1}/${totalChunks} done → ${outputPath}`);
   return outputPath;
+}
+
+// ============================================================================
+// RENDER CHUNKS IN PARALLEL (up to MAX_PARALLEL at a time)
+// ============================================================================
+async function renderChunksParallel(chunks, jobId) {
+  const results = new Array(chunks.length);
+  let nextIdx = 0;
+
+  async function worker() {
+    while (nextIdx < chunks.length) {
+      const i = nextIdx++;
+      results[i] = await renderChunk(chunks[i], jobId, i, chunks.length);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(MAX_PARALLEL, chunks.length) }, worker);
+  await Promise.all(workers);
+  return results;
 }
 
 // ============================================================================
 // CONCAT MP4 FILES WITH FFMPEG (stream copy — no re-encode, very fast)
 // ============================================================================
 function concatVideos(chunkPaths, outputPath, jobId) {
-  // Write a concat list file
   const listPath = path.join(TMP_DIR, `${jobId}-list.txt`);
   const listContent = chunkPaths.map((p) => `file '${p}'`).join("\n");
   fs.writeFileSync(listPath, listContent);
@@ -200,7 +317,7 @@ function concatVideos(chunkPaths, outputPath, jobId) {
       "-f", "concat",
       "-safe", "0",
       "-i", listPath,
-      "-c", "copy",        // stream copy — no re-encode
+      "-c", "copy",
       outputPath,
     ],
     { encoding: "utf-8", stdio: "pipe" }
@@ -219,9 +336,6 @@ function concatVideos(chunkPaths, outputPath, jobId) {
 // ============================================================================
 // SPLIT messages into chunks
 // Each chunk must start with a "you" message (required by ChatReel).
-// We walk the array and cut a new chunk whenever:
-//   a) we've hit CHUNK_SIZE messages in the current chunk AND
-//   b) the NEXT message is from "you" (so the chunk boundary is clean).
 // ============================================================================
 function splitIntoChunks(messages, chunkSize) {
   if (messages.length <= chunkSize) return [messages];
@@ -242,9 +356,7 @@ function splitIntoChunks(messages, chunkSize) {
     }
   }
 
-  // Safety: if current still has items (e.g. trailing partner message), append
   if (current.length > 0) {
-    // Merge into last chunk rather than having a chunk that starts with "partner"
     chunks[chunks.length - 1].push(...current);
   }
 
@@ -255,13 +367,11 @@ function splitIntoChunks(messages, chunkSize) {
 // POST /render
 // ============================================================================
 app.post("/render", async (req, res) => {
-  // ---- Auth ----
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (token !== API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  // ---- Parse body — accept both JSON and plain-text JSON ----
   let body = req.body;
   if (typeof body === "string") {
     try {
@@ -273,7 +383,6 @@ app.post("/render", async (req, res) => {
 
   const { messages } = body || {};
 
-  // ---- Validate ----
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({
       error: "Missing 'messages' array in request body",
@@ -290,8 +399,6 @@ app.post("/render", async (req, res) => {
     return res.status(400).json({ error: "Need at least 2 messages" });
   }
 
-  // NO upper limit — we chunk large conversations automatically.
-
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
 
@@ -307,7 +414,6 @@ app.post("/render", async (req, res) => {
       });
     }
 
-    // Clean em dashes silently
     messages[i].text = messages[i].text.replace(/—/g, " - ");
   }
 
@@ -317,7 +423,6 @@ app.post("/render", async (req, res) => {
     });
   }
 
-  // ---- Server ready? ----
   if (!bundleLocation) {
     return res.status(503).json({
       error: "Server is still starting up. Try again in 30 seconds.",
@@ -327,10 +432,10 @@ app.post("/render", async (req, res) => {
   const jobId = crypto.randomUUID().slice(0, 8);
   const startTime = Date.now();
   const finalOutput = path.join(TMP_DIR, `${jobId}-final.mp4`);
-  const chunkPaths = [];
+  let chunkPaths = [];
 
   console.log(
-    `[${jobId}] Request: ${messages.length} messages, CHUNK_SIZE=${CHUNK_SIZE}`
+    `[${jobId}] Request: ${messages.length} messages, CHUNK_SIZE=${CHUNK_SIZE}, concurrency=${CONCURRENCY}, parallel=${MAX_PARALLEL}`
   );
 
   try {
@@ -339,18 +444,13 @@ app.post("/render", async (req, res) => {
       `[${jobId}] Split into ${chunks.length} chunk(s): ${chunks.map((c) => c.length).join(", ")} messages`
     );
 
-    // Render all chunks sequentially (keeps memory manageable)
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkPath = await renderChunk(chunks[i], jobId, i, chunks.length);
-      chunkPaths.push(chunkPath);
-    }
+    // Render chunks — parallel when there are multiple
+    chunkPaths = await renderChunksParallel(chunks, jobId);
 
     let videoPath;
     if (chunks.length === 1) {
-      // Single chunk — just send it directly
       videoPath = chunkPaths[0];
     } else {
-      // Multiple chunks — concatenate
       concatVideos(chunkPaths, finalOutput, jobId);
       videoPath = finalOutput;
     }
@@ -369,7 +469,6 @@ app.post("/render", async (req, res) => {
     console.error(`[${jobId}] FAILED:`, err.message);
     return res.status(500).json({ error: "Render failed", detail: err.message });
   } finally {
-    // Cleanup all temp files
     for (const p of [...chunkPaths, finalOutput]) {
       if (fs.existsSync(p)) {
         try { fs.unlinkSync(p); } catch (_) {}
@@ -388,6 +487,9 @@ app.get("/health", (req, res) => {
     chromium: BROWSER_PATH || "remotion-managed",
     ffmpeg: FFMPEG,
     chunkSize: CHUNK_SIZE,
+    concurrency: CONCURRENCY,
+    maxParallelChunks: MAX_PARALLEL,
+    browserPoolSize: browserPool.length,
   });
 });
 
@@ -399,6 +501,8 @@ app.get("/", (req, res) => {
     service: "TrueU Chat Reel Renderer",
     status: bundleLocation ? "ready" : "warming up",
     chunkSize: CHUNK_SIZE,
+    concurrency: CONCURRENCY,
+    maxParallelChunks: MAX_PARALLEL,
     usage: {
       health: "GET /health",
       render: "POST /render with { messages: [...] }  — no message limit",
@@ -411,9 +515,13 @@ app.get("/", (req, res) => {
 // ============================================================================
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", async () => {
   console.log(`Server listening on 0.0.0.0:${PORT}`);
-  warmBundle()
-    .then(() => console.log("Ready for renders"))
-    .catch((err) => console.error("Bundle failed:", err.message));
+  try {
+    await warmBundle();
+    await initBrowserPool();
+    console.log("Ready for renders");
+  } catch (err) {
+    console.error("Startup failed:", err.message);
+  }
 });
