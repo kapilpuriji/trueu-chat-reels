@@ -23,7 +23,9 @@ RUN apt-get update && apt-get install -y \
 
 ENV CHROMIUM_PATH=/usr/bin/chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV NODE_OPTIONS=--max-old-space-size=2048
+# Keep Node heap below Railway's container RAM limit.
+# 512MB plan: use 400. 1GB plan: use 800. Adjust to match your Railway service RAM.
+ENV NODE_OPTIONS=--max-old-space-size=400
 # Railway injects PORT; keep a sane default for local docker runs.
 ENV PORT=3000
 
