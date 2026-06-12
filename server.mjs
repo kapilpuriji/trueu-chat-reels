@@ -156,9 +156,7 @@ async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
     serveUrl: bundleLocation,
     id: "ChatReel",
     inputProps,
-    // Tell Remotion's internal server to also serve the public/ directory
-    // so staticFile("background.mp4") resolves correctly during selectComposition.
-    timeoutInMilliseconds: 30000,
+    timeoutInMilliseconds: 120_000,
   });
 
   const durationSec = (composition.durationInFrames / composition.fps).toFixed(1);
