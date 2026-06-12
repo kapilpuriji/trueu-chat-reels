@@ -4,13 +4,23 @@
 // Run locally:  node server.mjs
 // Deploy on:    Railway
 //
-// Test:         GET  http://localhost:3000/health
-// Render:       POST http://localhost:3000/render
+// Async flow (solves n8n / proxy timeout problems):
+//   1. POST /render          → returns { jobId } immediately (202)
+//   2. GET  /status/:jobId   → returns { status, progress } — poll until done
+//   3. GET  /result/:jobId   → streams the MP4 when status === "done"
+//
+// Sync flow (for direct Postman testing):
+//   POST /render-sync        → waits and returns the MP4 directly (may timeout on slow clients)
+//
+// Other endpoints:
+//   GET  /health             → liveness check
+//   GET  /                   → usage info
 //
 // Environment variables:
-//   API_KEY   — Bearer token for auth (default: "changeme" for local testing)
-//   PORT      — Server port (default: 3000)
+//   API_KEY    — Bearer token for auth (default: "changeme" for local testing)
+//   PORT       — Server port (default: 3000)
 //   CHUNK_SIZE — Messages per chunk for long videos (default: 8)
+//   RESULT_TTL — Seconds to keep result files after completion (default: 3600)
 // ============================================================================
 
 import express from "express";
@@ -22,20 +32,36 @@ import fs from "fs";
 import crypto from "crypto";
 import { execSync, spawnSync } from "child_process";
 
-// Cross-platform temp directory (/tmp on Linux, os.tmpdir() on Windows)
+// Cross-platform temp directory
 const TMP_DIR = process.platform === "win32" ? os.tmpdir() : "/tmp";
 
 const app = express();
-// Increase body size limit — long chat transcripts can be large JSON
 app.use(express.json({ limit: "50mb" }));
 app.use(express.text({ limit: "50mb" }));
 
 const API_KEY = process.env.API_KEY || "changeme";
-
-// How many messages per chunk before we split into separate renders and concat.
-// Each chunk gets its OWN intro + outro so every segment is self-contained.
-// After rendering all chunks they are concatenated with ffmpeg (no re-encode).
 const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || "8", 10);
+const RESULT_TTL = parseInt(process.env.RESULT_TTL || "3600", 10) * 1000; // ms
+
+// ============================================================================
+// IN-MEMORY JOB STORE
+// { [jobId]: { status, progress, outputPath, error, createdAt } }
+// ============================================================================
+const jobs = new Map();
+
+// Clean up finished jobs + their files after TTL
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs.entries()) {
+    if ((job.status === "done" || job.status === "failed") &&
+        now - job.createdAt > RESULT_TTL) {
+      if (job.outputPath && fs.existsSync(job.outputPath)) {
+        try { fs.unlinkSync(job.outputPath); } catch (_) {}
+      }
+      jobs.delete(id);
+    }
+  }
+}, 60_000);
 
 // ============================================================================
 // FIND CHROMIUM
@@ -87,7 +113,7 @@ function findChromium() {
 const BROWSER_PATH = findChromium();
 
 // ============================================================================
-// CHECK FFMPEG — needed for chunk concatenation
+// FIND FFMPEG
 // ============================================================================
 function findFfmpeg() {
   const isWindows = process.platform === "win32";
@@ -103,8 +129,6 @@ function findFfmpeg() {
       }
     } catch (_) {}
   }
-  // On Windows or if `which` fails, just rely on PATH
-  console.warn("ffmpeg not found on explicit path — relying on PATH");
   return "ffmpeg";
 }
 
@@ -133,10 +157,58 @@ async function warmBundle() {
 }
 
 // ============================================================================
-// RENDER ONE CHUNK
-// Returns the output file path.
+// VALIDATE + NORMALIZE MESSAGES (shared by both endpoints)
+// Returns { messages } or throws { status, error }
 // ============================================================================
-async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
+function validateMessages(body) {
+  let parsed = body;
+  if (typeof parsed === "string") {
+    try { parsed = JSON.parse(parsed); } catch {
+      throw { status: 400, error: "Invalid JSON in request body" };
+    }
+  }
+
+  const { messages } = parsed || {};
+
+  if (!messages || !Array.isArray(messages)) {
+    throw {
+      status: 400,
+      error: "Missing 'messages' array in request body",
+      example: {
+        messages: [
+          { from: "you", text: "Your message" },
+          { from: "partner", text: "Partner reply" },
+        ],
+      },
+    };
+  }
+
+  if (messages.length < 2) {
+    throw { status: 400, error: "Need at least 2 messages" };
+  }
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg.from || !["you", "partner"].includes(msg.from)) {
+      throw { status: 400, error: `messages[${i}].from must be "you" or "partner", got "${msg.from}"` };
+    }
+    if (!msg.text || typeof msg.text !== "string" || msg.text.trim() === "") {
+      throw { status: 400, error: `messages[${i}].text is missing or empty` };
+    }
+    messages[i].text = messages[i].text.replace(/—/g, " - ");
+  }
+
+  if (messages[0].from !== "you") {
+    throw { status: 400, error: 'First message must be from "you" (it becomes the intro hook text)' };
+  }
+
+  return messages;
+}
+
+// ============================================================================
+// RENDER ONE CHUNK
+// ============================================================================
+async function renderChunk(messages, jobId, chunkIndex, totalChunks, onProgress) {
   const tag = totalChunks > 1 ? `${jobId}-c${chunkIndex}` : jobId;
   const outputPath = path.join(TMP_DIR, `${tag}.mp4`);
 
@@ -159,9 +231,7 @@ async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
   });
 
   const durationSec = (composition.durationInFrames / composition.fps).toFixed(1);
-  console.log(
-    `[${jobId}] Chunk ${chunkIndex + 1}/${totalChunks}: ${messages.length} msgs, ${durationSec}s`
-  );
+  console.log(`[${jobId}] Chunk ${chunkIndex + 1}/${totalChunks}: ${messages.length} msgs, ${durationSec}s`);
 
   await renderMedia({
     composition,
@@ -176,6 +246,14 @@ async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
       disableWebSecurity: true,
     },
     ...(BROWSER_PATH ? { browserExecutable: BROWSER_PATH } : {}),
+    onProgress: ({ progress }) => {
+      if (onProgress) {
+        // overall progress = chunk offset + this chunk's share
+        const chunkShare = 1 / totalChunks;
+        const overall = (chunkIndex * chunkShare) + (progress * chunkShare);
+        onProgress(Math.round(overall * 100));
+      }
+    },
   });
 
   console.log(`[${jobId}] Chunk ${chunkIndex + 1}/${totalChunks} done → ${outputPath}`);
@@ -183,30 +261,21 @@ async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
 }
 
 // ============================================================================
-// CONCAT MP4 FILES WITH FFMPEG (stream copy — no re-encode, very fast)
+// CONCAT MP4 FILES WITH FFMPEG
 // ============================================================================
 function concatVideos(chunkPaths, outputPath, jobId) {
-  // Write a concat list file
   const listPath = path.join(TMP_DIR, `${jobId}-list.txt`);
-  const listContent = chunkPaths.map((p) => `file '${p}'`).join("\n");
-  fs.writeFileSync(listPath, listContent);
+  fs.writeFileSync(listPath, chunkPaths.map((p) => `file '${p}'`).join("\n"));
 
   console.log(`[${jobId}] Concatenating ${chunkPaths.length} chunks...`);
 
   const result = spawnSync(
     FFMPEG,
-    [
-      "-y",
-      "-f", "concat",
-      "-safe", "0",
-      "-i", listPath,
-      "-c", "copy",        // stream copy — no re-encode
-      outputPath,
-    ],
+    ["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", outputPath],
     { encoding: "utf-8", stdio: "pipe" }
   );
 
-  fs.unlinkSync(listPath);
+  try { fs.unlinkSync(listPath); } catch (_) {}
 
   if (result.status !== 0) {
     throw new Error(`ffmpeg concat failed:\n${result.stderr}`);
@@ -217,11 +286,7 @@ function concatVideos(chunkPaths, outputPath, jobId) {
 }
 
 // ============================================================================
-// SPLIT messages into chunks
-// Each chunk must start with a "you" message (required by ChatReel).
-// We walk the array and cut a new chunk whenever:
-//   a) we've hit CHUNK_SIZE messages in the current chunk AND
-//   b) the NEXT message is from "you" (so the chunk boundary is clean).
+// SPLIT INTO CHUNKS
 // ============================================================================
 function splitIntoChunks(messages, chunkSize) {
   if (messages.length <= chunkSize) return [messages];
@@ -242,9 +307,7 @@ function splitIntoChunks(messages, chunkSize) {
     }
   }
 
-  // Safety: if current still has items (e.g. trailing partner message), append
   if (current.length > 0) {
-    // Merge into last chunk rather than having a chunk that starts with "partner"
     chunks[chunks.length - 1].push(...current);
   }
 
@@ -252,129 +315,211 @@ function splitIntoChunks(messages, chunkSize) {
 }
 
 // ============================================================================
-// POST /render
+// CORE RENDER PIPELINE — used by both async and sync endpoints
 // ============================================================================
-app.post("/render", async (req, res) => {
-  // ---- Auth ----
-  const token = req.headers.authorization?.replace("Bearer ", "");
-  if (token !== API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  // ---- Parse body — accept both JSON and plain-text JSON ----
-  let body = req.body;
-  if (typeof body === "string") {
-    try {
-      body = JSON.parse(body);
-    } catch {
-      return res.status(400).json({ error: "Invalid JSON in request body" });
-    }
-  }
-
-  const { messages } = body || {};
-
-  // ---- Validate ----
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({
-      error: "Missing 'messages' array in request body",
-      example: {
-        messages: [
-          { from: "you", text: "Your message" },
-          { from: "partner", text: "Partner reply" },
-        ],
-      },
-    });
-  }
-
-  if (messages.length < 2) {
-    return res.status(400).json({ error: "Need at least 2 messages" });
-  }
-
-  // NO upper limit — we chunk large conversations automatically.
-
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-
-    if (!msg.from || !["you", "partner"].includes(msg.from)) {
-      return res.status(400).json({
-        error: `messages[${i}].from must be "you" or "partner", got "${msg.from}"`,
-      });
-    }
-
-    if (!msg.text || typeof msg.text !== "string" || msg.text.trim() === "") {
-      return res.status(400).json({
-        error: `messages[${i}].text is missing or empty`,
-      });
-    }
-
-    // Clean em dashes silently
-    messages[i].text = messages[i].text.replace(/—/g, " - ");
-  }
-
-  if (messages[0].from !== "you") {
-    return res.status(400).json({
-      error: 'First message must be from "you" (it becomes the intro hook text)',
-    });
-  }
-
-  // ---- Server ready? ----
-  if (!bundleLocation) {
-    return res.status(503).json({
-      error: "Server is still starting up. Try again in 30 seconds.",
-    });
-  }
-
-  const jobId = crypto.randomUUID().slice(0, 8);
-  const startTime = Date.now();
+async function runRender(jobId, messages, onProgress) {
   const finalOutput = path.join(TMP_DIR, `${jobId}-final.mp4`);
   const chunkPaths = [];
 
-  console.log(
-    `[${jobId}] Request: ${messages.length} messages, CHUNK_SIZE=${CHUNK_SIZE}`
-  );
-
   try {
     const chunks = splitIntoChunks(messages, CHUNK_SIZE);
-    console.log(
-      `[${jobId}] Split into ${chunks.length} chunk(s): ${chunks.map((c) => c.length).join(", ")} messages`
-    );
+    console.log(`[${jobId}] Split into ${chunks.length} chunk(s): ${chunks.map((c) => c.length).join(", ")} messages`);
 
-    // Render all chunks sequentially (keeps memory manageable)
     for (let i = 0; i < chunks.length; i++) {
-      const chunkPath = await renderChunk(chunks[i], jobId, i, chunks.length);
+      const chunkPath = await renderChunk(chunks[i], jobId, i, chunks.length, onProgress);
       chunkPaths.push(chunkPath);
     }
 
     let videoPath;
     if (chunks.length === 1) {
-      // Single chunk — just send it directly
       videoPath = chunkPaths[0];
     } else {
-      // Multiple chunks — concatenate
       concatVideos(chunkPaths, finalOutput, jobId);
+      // clean up individual chunks now that they're merged
+      for (const p of chunkPaths) {
+        if (p !== finalOutput && fs.existsSync(p)) {
+          try { fs.unlinkSync(p); } catch (_) {}
+        }
+      }
       videoPath = finalOutput;
     }
 
-    const renderSec = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[${jobId}] Total done in ${renderSec}s`);
-
-    const videoBuffer = fs.readFileSync(videoPath);
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="reel-${jobId}.mp4"`
-    );
-    return res.send(videoBuffer);
+    return videoPath;
   } catch (err) {
-    console.error(`[${jobId}] FAILED:`, err.message);
-    return res.status(500).json({ error: "Render failed", detail: err.message });
-  } finally {
-    // Cleanup all temp files
+    // Clean up any partial files
     for (const p of [...chunkPaths, finalOutput]) {
-      if (fs.existsSync(p)) {
-        try { fs.unlinkSync(p); } catch (_) {}
-      }
+      if (fs.existsSync(p)) try { fs.unlinkSync(p); } catch (_) {}
     }
+    throw err;
+  }
+}
+
+// ============================================================================
+// AUTH MIDDLEWARE
+// ============================================================================
+function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace("Bearer ", "").trim();
+  if (token !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+// ============================================================================
+// POST /render  — ASYNC (returns job ID immediately, no timeout risk)
+// n8n workflow:
+//   1. HTTP Request → POST /render  → save jobId
+//   2. Wait node (30s)
+//   3. Loop: HTTP Request → GET /status/:jobId → if not done, wait + retry
+//   4. HTTP Request → GET /result/:jobId  → binary MP4
+// ============================================================================
+app.post("/render", requireAuth, (req, res) => {
+  let messages;
+  try {
+    messages = validateMessages(req.body);
+  } catch (e) {
+    return res.status(e.status).json({ error: e.error, example: e.example });
+  }
+
+  if (!bundleLocation) {
+    return res.status(503).json({ error: "Server is still starting up. Try again in 30 seconds." });
+  }
+
+  const jobId = crypto.randomUUID().slice(0, 8);
+
+  jobs.set(jobId, {
+    status: "rendering",
+    progress: 0,
+    outputPath: null,
+    error: null,
+    createdAt: Date.now(),
+  });
+
+  console.log(`[${jobId}] Job queued: ${messages.length} messages`);
+
+  // Fire and forget — render runs in background
+  runRender(jobId, messages, (pct) => {
+    const job = jobs.get(jobId);
+    if (job) job.progress = pct;
+  })
+    .then((outputPath) => {
+      const job = jobs.get(jobId);
+      if (job) {
+        job.status = "done";
+        job.progress = 100;
+        job.outputPath = outputPath;
+        console.log(`[${jobId}] Done → ${outputPath}`);
+      }
+    })
+    .catch((err) => {
+      const job = jobs.get(jobId);
+      if (job) {
+        job.status = "failed";
+        job.error = err.message;
+        console.error(`[${jobId}] FAILED:`, err.message);
+      }
+    });
+
+  return res.status(202).json({
+    jobId,
+    status: "rendering",
+    statusUrl: `/status/${jobId}`,
+    resultUrl: `/result/${jobId}`,
+    message: "Render started. Poll /status/:jobId every 15s, then GET /result/:jobId when done.",
+  });
+});
+
+// ============================================================================
+// GET /status/:jobId — poll this every 15-30 seconds from n8n
+// ============================================================================
+app.get("/status/:jobId", requireAuth, (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: "Job not found. It may have expired." });
+  }
+
+  return res.json({
+    jobId: req.params.jobId,
+    status: job.status,       // "rendering" | "done" | "failed"
+    progress: job.progress,   // 0-100
+    ...(job.error ? { error: job.error } : {}),
+    ...(job.status === "done" ? { resultUrl: `/result/${req.params.jobId}` } : {}),
+  });
+});
+
+// ============================================================================
+// GET /result/:jobId — download the MP4 once status === "done"
+// ============================================================================
+app.get("/result/:jobId", requireAuth, (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: "Job not found. It may have expired." });
+  }
+  if (job.status === "rendering") {
+    return res.status(202).json({ error: "Still rendering.", progress: job.progress });
+  }
+  if (job.status === "failed") {
+    return res.status(500).json({ error: "Render failed.", detail: job.error });
+  }
+  if (!job.outputPath || !fs.existsSync(job.outputPath)) {
+    return res.status(410).json({ error: "Result file has expired or was deleted." });
+  }
+
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Disposition", `attachment; filename="reel-${req.params.jobId}.mp4"`);
+  res.setHeader("Content-Length", fs.statSync(job.outputPath).size);
+
+  const stream = fs.createReadStream(job.outputPath);
+  stream.pipe(res);
+  stream.on("error", (err) => {
+    console.error(`[${req.params.jobId}] Stream error:`, err.message);
+    res.end();
+  });
+});
+
+// ============================================================================
+// POST /render-sync — SYNCHRONOUS (original behavior, for Postman testing)
+// WARNING: will timeout if render takes > client timeout (usually 5 min)
+// ============================================================================
+app.post("/render-sync", requireAuth, async (req, res) => {
+  let messages;
+  try {
+    messages = validateMessages(req.body);
+  } catch (e) {
+    return res.status(e.status).json({ error: e.error, example: e.example });
+  }
+
+  if (!bundleLocation) {
+    return res.status(503).json({ error: "Server is still starting up. Try again in 30 seconds." });
+  }
+
+  const jobId = crypto.randomUUID().slice(0, 8);
+  const startTime = Date.now();
+  console.log(`[${jobId}] Sync render: ${messages.length} messages`);
+
+  try {
+    const videoPath = await runRender(jobId, messages, null);
+    const renderSec = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[${jobId}] Sync done in ${renderSec}s`);
+
+    const stat = fs.statSync(videoPath);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Disposition", `attachment; filename="reel-${jobId}.mp4"`);
+    res.setHeader("Content-Length", stat.size);
+
+    const stream = fs.createReadStream(videoPath);
+    stream.pipe(res);
+    stream.on("finish", () => {
+      try { fs.unlinkSync(videoPath); } catch (_) {}
+    });
+    stream.on("error", (err) => {
+      console.error(`[${jobId}] Stream error:`, err.message);
+      try { fs.unlinkSync(videoPath); } catch (_) {}
+      res.end();
+    });
+  } catch (err) {
+    console.error(`[${jobId}] Sync FAILED:`, err.message);
+    return res.status(500).json({ error: "Render failed", detail: err.message });
   }
 });
 
@@ -388,6 +533,8 @@ app.get("/health", (req, res) => {
     chromium: BROWSER_PATH || "remotion-managed",
     ffmpeg: FFMPEG,
     chunkSize: CHUNK_SIZE,
+    activeJobs: [...jobs.values()].filter((j) => j.status === "rendering").length,
+    totalJobs: jobs.size,
   });
 });
 
@@ -398,10 +545,14 @@ app.get("/", (req, res) => {
   res.json({
     service: "TrueU Chat Reel Renderer",
     status: bundleLocation ? "ready" : "warming up",
-    chunkSize: CHUNK_SIZE,
     usage: {
+      asyncFlow: {
+        step1: "POST /render  → { jobId }",
+        step2: "GET  /status/:jobId  → poll every 15s until status=done",
+        step3: "GET  /result/:jobId  → download MP4",
+      },
+      syncFlow: "POST /render-sync  → MP4 directly (may timeout for long renders)",
       health: "GET /health",
-      render: "POST /render with { messages: [...] }  — no message limit",
     },
   });
 });
