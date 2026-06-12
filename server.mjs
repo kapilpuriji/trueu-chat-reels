@@ -17,9 +17,13 @@ import express from "express";
 import { bundle } from "@remotion/bundler";
 import { renderMedia, selectComposition } from "@remotion/renderer";
 import path from "path";
+import os from "os";
 import fs from "fs";
 import crypto from "crypto";
 import { execSync, spawnSync } from "child_process";
+
+// Cross-platform temp directory (/tmp on Linux, os.tmpdir() on Windows)
+const TMP_DIR = process.platform === "win32" ? os.tmpdir() : "/tmp";
 
 const app = express();
 // Increase body size limit — long chat transcripts can be large JSON
@@ -42,20 +46,32 @@ function findChromium() {
     process.env.PUPPETEER_EXECUTABLE_PATH,
   ];
 
-  const systemPaths = [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-  ];
+  const isWindows = process.platform === "win32";
 
-  try {
-    const result = execSync(
-      "which chromium 2>/dev/null || which chromium-browser 2>/dev/null || which google-chrome 2>/dev/null || echo ''",
-      { encoding: "utf-8" }
-    ).trim();
-    if (result) candidates.push(result);
-  } catch (_) {}
+  const systemPaths = isWindows
+    ? [
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        process.env.LOCALAPPDATA
+          ? `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`
+          : null,
+      ].filter(Boolean)
+    : [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+      ];
+
+  if (!isWindows) {
+    try {
+      const result = execSync(
+        "which chromium 2>/dev/null || which chromium-browser 2>/dev/null || which google-chrome 2>/dev/null || echo ''",
+        { encoding: "utf-8", shell: "/bin/sh" }
+      ).trim();
+      if (result) candidates.push(result);
+    } catch (_) {}
+  }
 
   for (const p of [...candidates, ...systemPaths]) {
     if (p && fs.existsSync(p)) {
@@ -74,14 +90,21 @@ const BROWSER_PATH = findChromium();
 // CHECK FFMPEG — needed for chunk concatenation
 // ============================================================================
 function findFfmpeg() {
-  try {
-    const r = execSync("which ffmpeg 2>/dev/null || echo ''", { encoding: "utf-8" }).trim();
-    if (r && fs.existsSync(r)) {
-      console.log("Found ffmpeg at:", r);
-      return r;
-    }
-  } catch (_) {}
-  console.warn("ffmpeg not found — chunked concat will fail for large chats");
+  const isWindows = process.platform === "win32";
+  if (!isWindows) {
+    try {
+      const r = execSync("which ffmpeg 2>/dev/null || echo ''", {
+        encoding: "utf-8",
+        shell: "/bin/sh",
+      }).trim();
+      if (r && fs.existsSync(r)) {
+        console.log("Found ffmpeg at:", r);
+        return r;
+      }
+    } catch (_) {}
+  }
+  // On Windows or if `which` fails, just rely on PATH
+  console.warn("ffmpeg not found on explicit path — relying on PATH");
   return "ffmpeg";
 }
 
@@ -115,7 +138,7 @@ async function warmBundle() {
 // ============================================================================
 async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
   const tag = totalChunks > 1 ? `${jobId}-c${chunkIndex}` : jobId;
-  const outputPath = path.join("/tmp", `${tag}.mp4`);
+  const outputPath = path.join(TMP_DIR, `${tag}.mp4`);
 
   const inputProps = {
     messages,
@@ -164,7 +187,7 @@ async function renderChunk(messages, jobId, chunkIndex, totalChunks) {
 // ============================================================================
 function concatVideos(chunkPaths, outputPath, jobId) {
   // Write a concat list file
-  const listPath = path.join("/tmp", `${jobId}-list.txt`);
+  const listPath = path.join(TMP_DIR, `${jobId}-list.txt`);
   const listContent = chunkPaths.map((p) => `file '${p}'`).join("\n");
   fs.writeFileSync(listPath, listContent);
 
@@ -303,7 +326,7 @@ app.post("/render", async (req, res) => {
 
   const jobId = crypto.randomUUID().slice(0, 8);
   const startTime = Date.now();
-  const finalOutput = path.join("/tmp", `${jobId}-final.mp4`);
+  const finalOutput = path.join(TMP_DIR, `${jobId}-final.mp4`);
   const chunkPaths = [];
 
   console.log(

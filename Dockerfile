@@ -16,9 +16,9 @@ RUN apt-get update && apt-get install -y \
     libgbm1 \
     libpango-1.0-0 \
     libcairo2 \
-    libasound2 \
     libxshmfence1 \
     --no-install-recommends \
+    && (apt-get install -y libasound2 || apt-get install -y libasound2t64 || true) \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CHROMIUM_PATH=/usr/bin/chromium
