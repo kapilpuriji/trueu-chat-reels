@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React from "react";
 import {
   AbsoluteFill,
   useCurrentFrame,
@@ -10,8 +10,7 @@ import {
   staticFile,
   Audio,
   Sequence,
-  delayRender,
-  continueRender,
+  Img,
 } from "remotion";
 import {
   Message,
@@ -636,71 +635,23 @@ const Logo: React.FC<{ image: string | null }> = ({ image }) => {
 
 // ============================================================================
 // ANIMATED ORB — plays the real TrueU brand orb as a sequence of transparent
-// PNG frames.
-//
-// All 75 frames are preloaded once via a single delayRender handle. This avoids
-// the "Waiting for root component to load" timeout that occurs when Remotion's
-// <Img> fires 75 separate delayRender calls on a cold Railway container.
+// PNG frames. Bulletproof alpha rendering (Img always honors PNG transparency,
+// unlike OffthreadVideo which flattens alpha during extraction).
 // ============================================================================
 const NUM_ORB_FRAMES = 75; // GIF source: 75 frames at 25fps over 3 seconds
 
-// Build all src URLs once at module level so they are stable references.
-const ORB_SRCS: string[] = Array.from({ length: NUM_ORB_FRAMES }, (_, i) =>
-  staticFile(`orb-frames/orb-${String(i + 1).padStart(3, "0")}.png`)
-);
-
-// Preload all orb frames using a single delayRender handle.
-// Returns null while loading, then the array of object URLs once ready.
-function useOrbFrames(): string[] | null {
-  const [srcs, setSrcs] = useState<string[] | null>(null);
-
-  useEffect(() => {
-    const handle = delayRender("Preloading orb frames");
-    let cancelled = false;
-
-    Promise.all(
-      ORB_SRCS.map(
-        (src) =>
-          new Promise<string>((resolve, reject) => {
-            const img = new Image();
-            img.onload = () => resolve(src);
-            img.onerror = () => reject(new Error(`Failed to load ${src}`));
-            img.src = src;
-          })
-      )
-    )
-      .then((loaded) => {
-        if (!cancelled) {
-          setSrcs(loaded);
-          continueRender(handle);
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) continueRender(handle);
-        console.error("Orb frame preload error:", err);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  return srcs;
-}
-
 const AnimatedOrb: React.FC<{
+  /** Unused, kept for API compatibility with old callers */
   frame?: number;
+  /** Unused, kept for API compatibility */
   fps?: number;
   size: number;
 }> = ({ size }) => {
   const currentFrame = useCurrentFrame();
-  const srcs = useOrbFrames();
-
-  // Map 30fps composition to 25fps source material
-  const orbFrameIdx = Math.floor((currentFrame * 25) / 30) % NUM_ORB_FRAMES;
-
-  // While frames are loading, render a transparent placeholder of the same size
-  const src = srcs ? srcs[orbFrameIdx] : null;
+  // Map 30fps composition timeline to 25fps GIF source timeline
+  const orbFrameIdx =
+    Math.floor((currentFrame * 25) / 30) % NUM_ORB_FRAMES;
+  const padded = String(orbFrameIdx + 1).padStart(3, "0");
 
   return (
     <div
@@ -711,16 +662,14 @@ const AnimatedOrb: React.FC<{
         flexShrink: 0,
       }}
     >
-      {src && (
-        <img
-          src={src}
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "contain",
-          }}
-        />
-      )}
+      <Img
+        src={staticFile(`orb-frames/orb-${padded}.png`)}
+        style={{
+          width: "100%",
+          height: "100%",
+          objectFit: "contain",
+        }}
+      />
     </div>
   );
 };
