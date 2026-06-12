@@ -64,9 +64,10 @@ if (bundleLocation) {
   console.log("Using pre-built bundle at", bundleLocation);
 }
 
-// Track ongoing renders so we can reject concurrent overload
+// Only one render at a time — swiftshader at 1080x1920 uses ~600MB per Chrome
+// tab; stacking renders causes "Page crashed" OOM even on 8GB containers.
 let activeRenders = 0;
-const MAX_CONCURRENT_RENDERS = 2;
+const MAX_CONCURRENT_RENDERS = 1;
 
 async function warmBundle() {
   if (bundleLocation) return;
@@ -218,10 +219,12 @@ app.post("/render", async (req, res) => {
       outputLocation: outputPath,
       inputProps,
 
-      // Speed settings — tuned for 8GB Railway container
-      concurrency: 4,              // 4 parallel Chrome tabs; 8GB handles this fine
-      jpegQuality: 80,             // Remotion default; balanced speed vs quality
-      x264Preset: "veryfast",      // Much faster encode, imperceptible quality diff for reels
+      // concurrency:1 — one Chrome tab at a time prevents "Page crashed" OOM.
+      // swiftshader uses ~600MB per tab at 1080x1920; even 2 tabs can exceed 8GB
+      // when combined with ffmpeg + Node heap during the stitch phase.
+      concurrency: 1,
+      jpegQuality: 60,               // lower = smaller per-frame buffer = less RAM
+      x264Preset: "veryfast",        // fast encode, no visible quality diff for reels
       timeoutInMilliseconds: 600000, // 10-minute ceiling per render
 
       chromiumOptions: {
